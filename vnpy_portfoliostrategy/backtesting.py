@@ -12,7 +12,7 @@ from collections.abc import Callable
 
 from vnpy.trader.constant import Direction, Offset, Interval, Status
 from vnpy.trader.database import get_database, BaseDatabase
-from vnpy.trader.object import OrderData, TradeData, BarData
+from vnpy.trader.object import OrderData, TradeData, BarData, TickData
 from vnpy.trader.utility import round_to, extract_vt_symbol
 from vnpy.trader.optimize import (
     OptimizationSetting,
@@ -27,6 +27,7 @@ from .template import StrategyTemplate
 
 
 INTERVAL_DELTA_MAP: dict[Interval, timedelta] = {
+    Interval.TICK: timedelta(milliseconds=1),
     Interval.MINUTE: timedelta(minutes=1),
     Interval.HOUR: timedelta(hours=1),
     Interval.DAILY: timedelta(days=1),
@@ -49,6 +50,7 @@ class BacktestingEngine:
         self.slippages: dict[str, float]
         self.sizes: dict[str, float]
         self.priceticks: dict[str, float]
+        self.minvolumes: dict[str, float]
 
         self.capital: float = 1_000_000
         self.risk_free: float = 0
@@ -57,11 +59,12 @@ class BacktestingEngine:
         self.strategy_class: type[StrategyTemplate]
         self.strategy: StrategyTemplate
         self.bars: dict[str, BarData] = {}
+        self.ticks: dict[str, TickData] = {}
         self.datetime: datetime = datetime(1970, 1, 1)
 
         self.interval: Interval
         self.days: int = 0
-        self.history_data: dict[tuple, BarData] = {}
+        self.history_data: dict[tuple, None] = {}
         self.dts: set[datetime] = set()
 
         self.limit_order_count: int = 0
@@ -98,6 +101,7 @@ class BacktestingEngine:
         slippages: dict[str, float],
         sizes: dict[str, float],
         priceticks: dict[str, float],
+        minvolumes: dict[str, float],
         capital: float = 0,
         end: datetime | None = None,
         risk_free: float = 0,
@@ -111,6 +115,7 @@ class BacktestingEngine:
         self.slippages = slippages
         self.sizes = sizes
         self.priceticks = priceticks
+        self.minvolumes = minvolumes
 
         self.start = start
         if not end:
@@ -129,6 +134,26 @@ class BacktestingEngine:
             self, strategy_class.__name__, copy(self.vt_symbols), setting
         )
 
+    def load_data_tick(self, start: datetime, end: datetime) -> None:
+        # 清理上次加载的历史数据
+        self.history_data.clear()
+        self.dts.clear()
+
+        for vt_symbol in self.vt_symbols:
+            data: list[TickData] = load_tick_data(
+                vt_symbol,
+                start,
+                end
+            )
+
+            data_count = 0
+            for tick in data:
+                self.dts.add(tick.datetime)
+                self.history_data[(tick.datetime, vt_symbol)] = tick
+                data_count += 1
+
+            self.output(_("{}历史数据加载完成，数据量：{}").format(vt_symbol, data_count))
+
     def load_data(self) -> None:
         """加载历史数据"""
         self.output(_("开始加载历史数据"))
@@ -138,6 +163,10 @@ class BacktestingEngine:
 
         if self.start >= self.end:
             self.output(_("起始日期必须小于结束日期"))
+            return
+
+        if self.interval == Interval.TICK:
+            self.output("TICK 数据回测不需要提前加载数据")
             return
 
         # 清理上次加载的历史数据
@@ -200,6 +229,11 @@ class BacktestingEngine:
 
     def run_backtesting(self) -> None:
         """开始回测"""
+        if self.interval == Interval.TICK:
+            func: Callable[[Any], None] = self.new_ticks
+        else:
+            func = self.new_bars
+
         self.strategy.on_init()
 
         dts: list = list(self.dts)
@@ -216,7 +250,7 @@ class BacktestingEngine:
                     break
 
             try:
-                self.new_bars(dt)
+                func(dt)
             except Exception:
                 self.output(_("触发异常，回测终止"))
                 self.output(traceback.format_exc())
@@ -230,13 +264,47 @@ class BacktestingEngine:
         self.output(_("开始回放历史数据"))
 
         # 使用剩余历史数据进行策略回测
-        for dt in dts[_ix:]:
-            try:
-                self.new_bars(dt)
-            except Exception:
-                self.output(_("触发异常，回测终止"))
-                self.output(traceback.format_exc())
-                return
+        if self.interval == Interval.TICK:
+            # 每次加载1天历史数据
+            progress_delta: timedelta = timedelta(days=1)
+            total_delta: timedelta = self.end - self.start
+            interval_delta: timedelta = INTERVAL_DELTA_MAP[self.interval]
+
+            start: datetime = self.start
+            end: datetime = self.start + progress_delta
+            progress: float = 0
+
+            while start < self.end:
+                end = min(end, self.end)
+
+                self.load_data_tick(start, end)
+                dts: list = list(self.dts)
+                dts.sort()
+                for dt in dts:
+                    try:
+                        func(dt)
+                    except Exception:
+                        self.output(_("触发异常，回测终止"))
+                        self.output(traceback.format_exc())
+                        return
+
+                progress += progress_delta / total_delta
+                progress = min(progress, 1)
+                progress_bar = "#" * int(progress * 10)
+                self.output("回测进度：{} [{:.0%}]".format(
+                    progress_bar, progress
+                ))
+
+                start = end + interval_delta
+                end += (progress_delta + interval_delta)
+        else:
+            for dt in dts[_ix:]:
+                try:
+                    func(dt)
+                except Exception:
+                    self.output(_("触发异常，回测终止"))
+                    self.output(traceback.format_exc())
+                    return
 
         self.output(_("历史数据回放结束"))
 
@@ -253,20 +321,17 @@ class BacktestingEngine:
             daily_result: PortfolioDailyResult = self.daily_results[d]
             daily_result.add_trade(trade)
 
-        pre_closes: dict = {}
-        start_poses: dict = {}
+        open_trades: dict[tuple, list[TradeData]] = None
 
         for daily_result in self.daily_results.values():
             daily_result.calculate_pnl(
-                pre_closes,
-                start_poses,
+                open_trades,
                 self.sizes,
                 self.rates,
-                self.slippages,
+                self.slippages
             )
 
-            pre_closes = daily_result.close_prices
-            start_poses = daily_result.end_poses
+            open_trades = daily_result.open_trades
 
         results: dict = defaultdict(list)
 
@@ -369,7 +434,7 @@ class BacktestingEngine:
             daily_turnover = total_turnover / total_days
 
             total_trade_count = df["trade_count"].sum()
-            daily_trade_count = total_trade_count / total_days
+            daily_trade_count = total_trade_count // total_days
 
             total_return = (end_balance / self.capital - 1) * 100
             annual_return = total_return / total_days * self.annual_days
@@ -382,7 +447,7 @@ class BacktestingEngine:
             else:
                 sharpe_ratio = 0
 
-            return_drawdown_ratio = -total_net_pnl / max_drawdown
+            return_drawdown_ratio = -total_net_pnl / max_drawdown if max_drawdown != 0 else 0.0
 
         # 输出结果
         if output:
@@ -554,20 +619,14 @@ class BacktestingEngine:
 
         return results
 
-    def update_daily_close(self, bars: dict[str, BarData], dt: datetime) -> None:
+    def update_daily_close(self, dt: datetime) -> None:
         """更新每日收盘价"""
         d: date = dt.date()
 
-        close_prices: dict = {}
-        for bar in bars.values():
-            close_prices[bar.vt_symbol] = bar.close_price
-
         daily_result: PortfolioDailyResult | None = self.daily_results.get(d, None)
 
-        if daily_result:
-            daily_result.update_close_prices(close_prices)
-        else:
-            self.daily_results[d] = PortfolioDailyResult(d, close_prices)
+        if daily_result is None:
+            self.daily_results[d] = PortfolioDailyResult(d)
 
     def new_bars(self, dt: datetime) -> None:
         """历史数据推送"""
@@ -603,17 +662,41 @@ class BacktestingEngine:
         self.strategy.on_bars(bars)
 
         if self.strategy.inited:
-            self.update_daily_close(self.bars, dt)
+            self.update_daily_close(dt)
+
+    def new_ticks(self, dt: datetime) -> None:
+        """历史数据推送"""
+        self.datetime = dt
+
+        for vt_symbol in self.vt_symbols:
+            tick: TickData | None = self.history_data.get((dt, vt_symbol), None)
+
+            # 判断是否获取到该合约指定时间的历史数据
+            if tick:
+                # 更新K线以供委托撮合
+                self.ticks[vt_symbol] = tick
+
+                self.cross_limit_order()
+                self.strategy.on_tick(tick)
+
+        if self.strategy.inited:
+            self.update_daily_close(dt)
 
     def cross_limit_order(self) -> None:
         """撮合限价委托"""
         for order in list(self.active_limit_orders.values()):
-            bar: BarData = self.bars[order.vt_symbol]
-
-            long_cross_price: float = bar.low_price
-            short_cross_price: float = bar.high_price
-            long_best_price: float = bar.open_price
-            short_best_price: float = bar.open_price
+            if self.interval == Interval.TICK:
+                tick = self.ticks[order.vt_symbol]
+                long_cross_price: float = tick.ask_price_1
+                short_cross_price: float = tick.bid_price_1
+                long_best_price: float = long_cross_price
+                short_best_price: float = short_cross_price
+            else:
+                bar: BarData = self.bars[order.vt_symbol]
+                long_cross_price: float = bar.low_price
+                short_cross_price: float = bar.high_price
+                long_best_price: float = bar.open_price
+                short_best_price: float = bar.open_price
 
             # 推送委托未成交状态更新
             if order.status == Status.SUBMITTING:
@@ -738,6 +821,10 @@ class BacktestingEngine:
         """获取引擎类型"""
         return self.engine_type
 
+    def get_min_volume(self, strategy: StrategyTemplate, vt_symbol: str) -> float:
+        """查询合约最小数量"""
+        return self.minvolumes[vt_symbol]
+
     def get_pricetick(self, strategy: StrategyTemplate, vt_symbol: str) -> float:
         """获取合约价格跳动"""
         return self.priceticks[vt_symbol]
@@ -770,11 +857,10 @@ class BacktestingEngine:
 class ContractDailyResult:
     """合约每日盈亏结果"""
 
-    def __init__(self, result_date: date, close_price: float) -> None:
+    def __init__(self, result_date: date) -> None:
         """构造函数"""
         self.date: date = result_date
-        self.close_price: float = close_price
-        self.pre_close: float = 0
+        self.open_trades: dict[tuple, list[TradeData]] = {}
 
         self.trades: list[TradeData] = []
         self.trade_count: int = 0
@@ -795,41 +881,84 @@ class ContractDailyResult:
         """添加成交信息"""
         self.trades.append(trade)
 
+    def _direction_pos(self, direction: Direction, offset: Offset) -> Direction:
+        """
+        判断持仓方向
+        """
+        if (direction == Direction.LONG and offset == Offset.OPEN) \
+            or (direction == Direction.SHORT and offset == Offset.CLOSE):
+            return Direction.LONG
+        else:
+            return Direction.SHORT
+
     def calculate_pnl(
         self,
-        pre_close: float,
-        start_pos: float,
+        open_trades: dict[tuple, list[TradeData]],
         size: float,
         rate: float,
         slippage: float
     ) -> None:
         """计算盈亏"""
-        # 记录昨收盘价
-        self.pre_close = pre_close
-
-        # 计算持仓盈亏
-        self.start_pos = start_pos
-        self.end_pos = start_pos
-
-        self.holding_pnl = self.start_pos * (self.close_price - self.pre_close) * size
-
-        # 计算交易盈亏
         self.trade_count = len(self.trades)
 
+        if open_trades:
+            for key, trades in open_trades.items():
+                self.open_trades[key] = trades
+
+        pre_closes: dict[str, float] = {}
+
         for trade in self.trades:
-            if trade.direction == Direction.LONG:
-                pos_change = trade.volume
-            else:
-                pos_change = -trade.volume
+            direction = self._direction_pos(trade.direction, trade.offset)
+            key = (trade.symbol, direction)
 
-            self.end_pos += pos_change
+            pre_closes[trade.vt_symbol] = trade.price
 
-            turnover: float = trade.volume * size * trade.price
+            if trade.offset == Offset.OPEN:
+                self.open_trades.setdefault(key, []).append(copy(trade))
+            elif trade.offset == Offset.CLOSE:
+                close_price = trade.price
+                close_vol = trade.volume
 
-            self.trading_pnl += pos_change * (self.close_price - trade.price) * size
-            self.slippage += trade.volume * size * slippage
-            self.turnover += turnover
-            self.commission += turnover * rate
+                while close_vol > 1e-8 and key in self.open_trades:
+                    # 取最早开仓
+                    first = self.open_trades[key][0]
+                    open_vol = first.volume
+
+                    match_vol = min(close_vol, open_vol)
+
+                    if self._direction_pos(trade.direction, trade.offset) == Direction.LONG:
+                        pnl = (close_price - first.price) * match_vol * size
+                    else:
+                        pnl = (first.price - close_price) * match_vol * size
+
+                    turnover: float = match_vol * first.price * size
+                    turnover += match_vol * close_price * size
+
+                    self.trading_pnl += pnl
+                    self.commission += turnover * rate
+                    self.turnover += turnover
+
+                    close_vol -= match_vol
+                    open_vol -= match_vol
+
+                    if open_vol < 1e-8:
+                        self.open_trades[key].pop(0)
+                        if len(self.open_trades[key]) == 0:
+                            self.open_trades.pop(key)
+                    else:
+                        first.volume = open_vol
+        if pre_closes:
+            for _, trades in self.open_trades.items():
+                for trade in trades:
+                    last_price = pre_closes.get(trade.vt_symbol, None)
+                    if last_price is None:
+                        continue
+                    if self._direction_pos(trade.direction, trade.offset) == Direction.LONG:
+                        pnl = (last_price - trade.price) * trade.volume * size
+                    else:
+                        pnl = (trade.price - last_price) * trade.volume * size
+                    self.holding_pnl += pnl
+                    trade.price = last_price
 
         # 计算每日盈亏
         self.total_pnl = self.trading_pnl + self.holding_pnl
@@ -839,22 +968,15 @@ class ContractDailyResult:
         """更新每日收盘价"""
         self.close_price = close_price
 
-
 class PortfolioDailyResult:
     """组合每日盈亏结果"""
 
-    def __init__(self, result_date: date, close_prices: dict[str, float]) -> None:
+    def __init__(self, result_date: date) -> None:
         """"""
         self.date: date = result_date
-        self.close_prices: dict[str, float] = close_prices
-        self.pre_closes: dict[str, float] = {}
-        self.start_poses: dict[str, float] = {}
-        self.end_poses: dict[str, float] = {}
+        self.open_trades: dict[tuple, list[TradeData]] = {}
 
         self.contract_results: dict[str, ContractDailyResult] = {}
-
-        for vt_symbol, close_price in close_prices.items():
-            self.contract_results[vt_symbol] = ContractDailyResult(result_date, close_price)
 
         self.trade_count: int = 0
         self.turnover: float = 0
@@ -867,25 +989,28 @@ class PortfolioDailyResult:
 
     def add_trade(self, trade: TradeData) -> None:
         """添加成交信息"""
-        contract_result: ContractDailyResult = self.contract_results[trade.vt_symbol]
+        contract_result: ContractDailyResult = self.contract_results.get(trade.vt_symbol, None)
+        if contract_result is None:
+            contract_result = ContractDailyResult(self.date)
+            self.contract_results[trade.vt_symbol] = contract_result
         contract_result.add_trade(trade)
 
     def calculate_pnl(
         self,
-        pre_closes: dict[str, float],
-        start_poses: dict[str, float],
+        open_trades: dict[tuple, list[TradeData]],
         sizes: dict[str, float],
         rates: dict[str, float],
         slippages: dict[str, float],
     ) -> None:
         """计算盈亏"""
-        self.pre_closes = pre_closes
-        self.start_poses = start_poses
+
+        if open_trades:
+            for key, trades in open_trades.items():
+                self.open_trades[key] = trades
 
         for vt_symbol, contract_result in self.contract_results.items():
             contract_result.calculate_pnl(
-                pre_closes.get(vt_symbol, 0),
-                start_poses.get(vt_symbol, 0),
+                self.open_trades,
                 sizes[vt_symbol],
                 rates[vt_symbol],
                 slippages[vt_symbol]
@@ -900,7 +1025,7 @@ class PortfolioDailyResult:
             self.total_pnl += contract_result.total_pnl
             self.net_pnl += contract_result.net_pnl
 
-            self.end_poses[vt_symbol] = contract_result.end_pos
+            self.open_trades = contract_result.open_trades
 
     def update_close_prices(self, close_prices: dict[str, float]) -> None:
         """更新每日收盘价"""
@@ -932,6 +1057,20 @@ def load_bar_data(
 
     return bars
 
+def load_tick_data(
+    vt_symbol: str,
+    start: datetime,
+    end: datetime
+) -> list[TickData]:
+    """"""
+    symbol, exchange = extract_vt_symbol(vt_symbol)
+
+    database: BaseDatabase = get_database()
+
+    ticks: list[TickData] = database.load_tick_data(
+        symbol, exchange, start, end
+    )
+    return ticks
 
 def evaluate(
     target_name: str,
@@ -943,6 +1082,7 @@ def evaluate(
     slippages: dict[str, float],
     sizes: dict[str, float],
     priceticks: dict[str, float],
+    minvolumes: dict[str, float],
     capital: float,
     end: datetime,
     setting: dict
@@ -958,6 +1098,7 @@ def evaluate(
         slippages=slippages,
         sizes=sizes,
         priceticks=priceticks,
+        minvolumes=minvolumes,
         capital=capital,
         end=end,
     )
@@ -985,6 +1126,7 @@ def wrap_evaluate(engine: BacktestingEngine, target_name: str) -> Callable:
         engine.slippages,
         engine.sizes,
         engine.priceticks,
+        engine.minvolumes,
         engine.capital,
         engine.end
     )

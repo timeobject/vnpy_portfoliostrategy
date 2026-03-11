@@ -230,6 +230,16 @@ class StrategyEngine(BaseEngine):
         """获取引擎类型"""
         return self.engine_type
 
+    def get_min_volume(self, strategy: StrategyTemplate, vt_symbol: str) -> float | None:
+        """查询合约最小数量"""
+        contract: ContractData | None = self.main_engine.get_contract(vt_symbol)
+
+        if contract:
+            min_volume: float = contract.min_volume
+            return min_volume
+        else:
+            return None
+
     def get_pricetick(self, strategy: StrategyTemplate, vt_symbol: str) -> float | None:
         """获取合约价格跳动"""
         contract: ContractData | None = self.main_engine.get_contract(vt_symbol)

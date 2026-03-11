@@ -33,8 +33,8 @@ class StrategyTemplate(ABC):
         self.trading: bool = False
 
         # 持仓数据字典
-        self.pos_data: dict[str, int] = defaultdict(int)        # 实际持仓
-        self.target_data: dict[str, int] = defaultdict(int)     # 目标持仓
+        self.pos_data: dict[str, float] = defaultdict(float)        # 实际持仓
+        self.target_data: dict[str, float] = defaultdict(float)     # 目标持仓
 
         # 委托缓存容器
         self.orders: dict[str, OrderData] = {}
@@ -175,15 +175,15 @@ class StrategyTemplate(ABC):
         for vt_orderid in list(self.active_orderids):
             self.cancel_order(vt_orderid)
 
-    def get_pos(self, vt_symbol: str) -> int:
+    def get_pos(self, vt_symbol: str) -> float:
         """查询当前持仓"""
         return self.pos_data.get(vt_symbol, 0)
 
-    def get_target(self, vt_symbol: str) -> int:
+    def get_target(self, vt_symbol: str) -> float:
         """查询目标仓位"""
         return self.target_data[vt_symbol]
 
-    def set_target(self, vt_symbol: str, target: int) -> None:
+    def set_target(self, vt_symbol: str, target: float) -> None:
         """设置目标仓位"""
         self.target_data[vt_symbol] = target
 
@@ -273,6 +273,10 @@ class StrategyTemplate(ABC):
     def get_engine_type(self) -> EngineType:
         """查询引擎类型"""
         return cast(EngineType, self.strategy_engine.get_engine_type())
+
+    def get_min_volume(self, vt_symbol: str) -> float:
+        """查询合约最小数量"""
+        return cast(float, self.strategy_engine.get_min_volume(self, vt_symbol))
 
     def get_pricetick(self, vt_symbol: str) -> float:
         """查询合约最小价格跳动"""
