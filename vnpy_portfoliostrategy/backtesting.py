@@ -321,17 +321,17 @@ class BacktestingEngine:
             daily_result: PortfolioDailyResult = self.daily_results[d]
             daily_result.add_trade(trade)
 
-        open_trades: dict[tuple, list[TradeData]] = None
+        pre_trades: dict[str, list[TradeData]] = {}
 
         for daily_result in self.daily_results.values():
             daily_result.calculate_pnl(
-                open_trades,
+                pre_trades,
                 self.sizes,
                 self.rates,
                 self.slippages
             )
 
-            open_trades = daily_result.open_trades
+            pre_trades = daily_result.pre_trades
 
         results: dict = defaultdict(list)
 
@@ -619,14 +619,31 @@ class BacktestingEngine:
 
         return results
 
-    def update_daily_close(self, dt: datetime) -> None:
+    def update_daily_close_tick(self, tick: TickData, dt: datetime) -> None:
         """更新每日收盘价"""
         d: date = dt.date()
 
         daily_result: PortfolioDailyResult | None = self.daily_results.get(d, None)
 
-        if daily_result is None:
+        if daily_result:
+            daily_result.update_close_tick(tick)
+        else:
             self.daily_results[d] = PortfolioDailyResult(d)
+
+    def update_daily_close(self, bars: dict[str, BarData], dt: datetime) -> None:
+        """更新每日收盘价"""
+        d: date = dt.date()
+
+        close_prices: dict = {}
+        for bar in bars.values():
+            close_prices[bar.vt_symbol] = bar.close_price
+
+        daily_result: PortfolioDailyResult | None = self.daily_results.get(d, None)
+
+        if daily_result:
+            daily_result.update_close_prices(close_prices)
+        else:
+            self.daily_results[d] = PortfolioDailyResult(d, close_prices)
 
     def new_bars(self, dt: datetime) -> None:
         """历史数据推送"""
@@ -662,7 +679,7 @@ class BacktestingEngine:
         self.strategy.on_bars(bars)
 
         if self.strategy.inited:
-            self.update_daily_close(dt)
+            self.update_daily_close(self.bars, dt)
 
     def new_ticks(self, dt: datetime) -> None:
         """历史数据推送"""
@@ -679,8 +696,8 @@ class BacktestingEngine:
                 self.cross_limit_order()
                 self.strategy.on_tick(tick)
 
-        if self.strategy.inited:
-            self.update_daily_close(dt)
+                if self.strategy.inited:
+                    self.update_daily_close_tick(tick, dt)
 
     def cross_limit_order(self) -> None:
         """撮合限价委托"""
@@ -857,10 +874,11 @@ class BacktestingEngine:
 class ContractDailyResult:
     """合约每日盈亏结果"""
 
-    def __init__(self, result_date: date) -> None:
+    def __init__(self, result_date: date, close_price: float) -> None:
         """构造函数"""
         self.date: date = result_date
-        self.open_trades: dict[tuple, list[TradeData]] = {}
+        self.close_price: float = close_price
+        self.pre_trades: list[TradeData] = []
 
         self.trades: list[TradeData] = []
         self.trade_count: int = 0
@@ -893,35 +911,33 @@ class ContractDailyResult:
 
     def calculate_pnl(
         self,
-        open_trades: dict[tuple, list[TradeData]],
+        pre_trades: list[TradeData],
         size: float,
         rate: float,
         slippage: float
     ) -> None:
         """计算盈亏"""
+
         self.trade_count = len(self.trades)
 
-        if open_trades:
-            for key, trades in open_trades.items():
-                self.open_trades[key] = trades
+        for trade in reversed(pre_trades):
+            self.trades.insert(0, trade)
 
-        pre_closes: dict[str, float] = {}
+        open_trades: dict[tuple, list[TradeData]] = {}
 
         for trade in self.trades:
             direction = self._direction_pos(trade.direction, trade.offset)
             key = (trade.symbol, direction)
 
-            pre_closes[trade.vt_symbol] = trade.price
-
             if trade.offset == Offset.OPEN:
-                self.open_trades.setdefault(key, []).append(copy(trade))
+                open_trades.setdefault(key, []).append(trade)
             elif trade.offset == Offset.CLOSE:
                 close_price = trade.price
                 close_vol = trade.volume
 
-                while close_vol > 1e-8 and key in self.open_trades:
+                while close_vol > 1e-8 and key in open_trades:
                     # 取最早开仓
-                    first = self.open_trades[key][0]
+                    first = open_trades[key][0]
                     open_vol = first.volume
 
                     match_vol = min(close_vol, open_vol)
@@ -942,23 +958,21 @@ class ContractDailyResult:
                     open_vol -= match_vol
 
                     if open_vol < 1e-8:
-                        self.open_trades[key].pop(0)
-                        if len(self.open_trades[key]) == 0:
-                            self.open_trades.pop(key)
+                        open_trades[key].pop(0)
+                        if len(open_trades[key]) == 0:
+                            open_trades.pop(key)
                     else:
                         first.volume = open_vol
-        if pre_closes:
-            for _, trades in self.open_trades.items():
-                for trade in trades:
-                    last_price = pre_closes.get(trade.vt_symbol, None)
-                    if last_price is None:
-                        continue
-                    if self._direction_pos(trade.direction, trade.offset) == Direction.LONG:
-                        pnl = (last_price - trade.price) * trade.volume * size
-                    else:
-                        pnl = (trade.price - last_price) * trade.volume * size
-                    self.holding_pnl += pnl
-                    trade.price = last_price
+
+        for _, trades in open_trades.items():
+            for trade in trades:
+                if self._direction_pos(trade.direction, trade.offset) == Direction.LONG:
+                    pnl = (self.close_price - trade.price) * trade.volume * size
+                else:
+                    pnl = (trade.price - self.close_price) * trade.volume * size
+                self.holding_pnl += pnl
+                trade.price = self.close_price
+                self.pre_trades.append(trade)
 
         # 计算每日盈亏
         self.total_pnl = self.trading_pnl + self.holding_pnl
@@ -971,12 +985,15 @@ class ContractDailyResult:
 class PortfolioDailyResult:
     """组合每日盈亏结果"""
 
-    def __init__(self, result_date: date) -> None:
+    def __init__(self, result_date: date, close_prices: dict[str, float] = {}) -> None:
         """"""
         self.date: date = result_date
-        self.open_trades: dict[tuple, list[TradeData]] = {}
+        self.pre_trades: dict[str, list[TradeData]] = {}
 
         self.contract_results: dict[str, ContractDailyResult] = {}
+
+        for vt_symbol, close_price in close_prices.items():
+            self.contract_results[vt_symbol] = ContractDailyResult(result_date, close_price)
 
         self.trade_count: int = 0
         self.turnover: float = 0
@@ -989,28 +1006,21 @@ class PortfolioDailyResult:
 
     def add_trade(self, trade: TradeData) -> None:
         """添加成交信息"""
-        contract_result: ContractDailyResult = self.contract_results.get(trade.vt_symbol, None)
-        if contract_result is None:
-            contract_result = ContractDailyResult(self.date)
-            self.contract_results[trade.vt_symbol] = contract_result
+        contract_result: ContractDailyResult = self.contract_results[trade.vt_symbol]
         contract_result.add_trade(trade)
 
     def calculate_pnl(
         self,
-        open_trades: dict[tuple, list[TradeData]],
+        pre_trades: dict[str, list[TradeData]],
         sizes: dict[str, float],
         rates: dict[str, float],
         slippages: dict[str, float],
     ) -> None:
         """计算盈亏"""
 
-        if open_trades:
-            for key, trades in open_trades.items():
-                self.open_trades[key] = trades
-
         for vt_symbol, contract_result in self.contract_results.items():
             contract_result.calculate_pnl(
-                self.open_trades,
+                pre_trades.get(vt_symbol, []),
                 sizes[vt_symbol],
                 rates[vt_symbol],
                 slippages[vt_symbol]
@@ -1025,12 +1035,18 @@ class PortfolioDailyResult:
             self.total_pnl += contract_result.total_pnl
             self.net_pnl += contract_result.net_pnl
 
-            self.open_trades = contract_result.open_trades
+            self.pre_trades[vt_symbol] = contract_result.pre_trades
+
+    def update_close_tick(self, tick: TickData) -> None:
+        """更新每日收盘价"""
+        contract_result: ContractDailyResult | None = self.contract_results.get(tick.vt_symbol, None)
+        if contract_result:
+            contract_result.update_close_price(tick.last_price)
+        else:
+            self.contract_results[tick.vt_symbol] = ContractDailyResult(self.date, tick.last_price)
 
     def update_close_prices(self, close_prices: dict[str, float]) -> None:
         """更新每日收盘价"""
-        self.close_prices.update(close_prices)
-
         for vt_symbol, close_price in close_prices.items():
             contract_result: ContractDailyResult | None = self.contract_results.get(vt_symbol, None)
             if contract_result:
